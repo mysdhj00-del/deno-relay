@@ -404,5 +404,231 @@ Deno.serve(async (req: Request) => {
     }
   }
 
+  if (url.pathname === "/xfetch") {
+    // Cross-IP probe helper (added 2026-10-17 for the Doodstream
+    // IP-binding experiment): fetches a URL from THIS service's egress
+    // with a 1 KB Range header, reads at most the first chunk, and
+    // reports only the status + byte count. No body is returned.
+    const target = url.searchParams.get("url");
+    if (!target) return json({ status: 0, error: "missing url param" }, 400);
+    try {
+      const res = await fetch(target, {
+        headers: { Range: "bytes=0-1023" },
+        signal: AbortSignal.timeout(20000),
+      });
+      let bytesRead = 0;
+      if (res.body) {
+        const reader = res.body.getReader();
+        const first = await reader.read();
+        if (first.value) bytesRead = first.value.byteLength;
+        await reader.cancel().catch(() => {});
+      }
+      return json({ status: res.status, bytesRead });
+    } catch (e) {
+      return json({ status: 0, error: String((e as Error)?.message || e) });
+    }
+  }
+
+  if (url.pathname === "/relay/vid") {
+    const src = url.searchParams.get("src");
+    if (!src) return json({ ok: false, error: "missing src param" }, 400);
+    try {
+      return json(await relayVidD(url, src));
+    } catch (e) {
+      return json({ ok: false, error: String((e as Error)?.message || e) });
+    }
+  }
+
+  if (url.pathname === "/relay/hls" || url.pathname.startsWith("/relay/hls/")) {
+    return relayHlsD(req);
+  }
+
+  if (url.pathname === "/relay/hits") {
+    if (url.searchParams.get("k") !== HITS_KEY_D) {
+      return json({ ok: false, error: "forbidden" }, 403);
+    }
+    return json({ hits: hitLogD });
+  }
+
   return new Response("not found", { status: 404 });
 });
+
+// ============================================================ STREAM PROXY
+// Ported 2026-10-18 from the Render service (src/relay.js relayVid /
+// relayHls) as the SECOND DOOR for EgyDead v20: the provider tries the
+// Render door first, then this Deno door. Same design and same law: the
+// egybestvid CDN binds its stream token to the fetching identity's IP
+// AND full header profile at master, variant AND segment level, and the
+// player cannot carry that profile — so the proxy digs AND fetches with
+// one fixed full-header identity and the phone only ever talks to us.
+//   GET /relay/vid?src=<egybestvid embed URL>[&pv=20]
+//       -> { ok, master:<proxied URL>, diag }
+//   GET /relay/hls/m.m3u8?u=<base64url target>&r=<base64url referer>[&pv=20]
+//       -> the target fetched with the proxy identity; playlists are
+//          rewritten so every resource resolves back through /relay/hls.
+//   GET /relay/hits?k=<key> -> the in-memory hit log (pv-tagged), so one
+//          tap on the phone is fully visible server-side.
+
+const vidCacheD = new Map<string, { at: number; master: string }>();
+const VID_TTL_MS = 30 * 60 * 1000;
+const HITS_KEY_D = "saher-obs-7f3";
+const hitLogD: Record<string, unknown>[] = [];
+function logHitD(route: string, info: Record<string, unknown>) {
+  hitLogD.push({ t: new Date().toISOString(), route, ...info });
+  if (hitLogD.length > 120) hitLogD.shift();
+}
+
+function b64eD(s: string): string {
+  return btoa(unescape(encodeURIComponent(String(s))))
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function b64dD(s: string): string {
+  const b = String(s || "").replace(/-/g, "+").replace(/_/g, "/");
+  return decodeURIComponent(escape(atob(b)));
+}
+
+function isVidHostD(host: string): boolean {
+  const h = (host || "").toLowerCase();
+  return h === "egybestvid.com" || h.endsWith(".egybestvid.com");
+}
+
+function hlsProxyUrlD(origin: string, target: string, referer: string, pv: string): string {
+  const p = pv ? `&pv=${encodeURIComponent(pv)}` : "";
+  return `${origin}/relay/hls/m.m3u8?u=${encodeURIComponent(b64eD(target))}&r=${encodeURIComponent(b64eD(referer))}${p}`;
+}
+
+async function relayVidD(reqUrl: URL, src: string) {
+  const pv = reqUrl.searchParams.get("pv") || "";
+  let parsed: URL;
+  try {
+    parsed = new URL(src);
+  } catch {
+    return { ok: false, error: "bad src" };
+  }
+  if (!isVidHostD(parsed.hostname)) {
+    return { ok: false, error: "src must be an egybestvid embed URL" };
+  }
+  const cached = vidCacheD.get(src);
+  if (cached && Date.now() - cached.at < VID_TTL_MS) {
+    logHitD("vid", { src: src.split("/").pop(), ok: true, cached: 1, pv, door: "deno" });
+    return { ok: true, master: hlsProxyUrlD(reqUrl.origin, cached.master, src, pv), diag: { cached: 1 } };
+  }
+  let status = 0;
+  let text = "";
+  try {
+    const res = await fetch(src, {
+      redirect: "follow",
+      signal: AbortSignal.timeout(25000),
+      headers: { ...BROWSER_HEADERS, Referer: "https://egydead.ca/" },
+    });
+    status = res.status;
+    text = await res.text();
+  } catch (e) {
+    logHitD("vid", { src: src.split("/").pop(), ok: false, err: String((e as Error)?.message || e).slice(0, 60), pv, door: "deno" });
+    return { ok: false, error: String((e as Error)?.message || e) };
+  }
+  const clean = text.replace(/\\\//g, "/");
+  let master: string | null = null;
+  const fileM = /file\s*:\s*["'](https?:[^"']+\.m3u8[^"']*)["']/.exec(clean);
+  if (fileM) master = fileM[1];
+  if (!master) {
+    const bare = /https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/.exec(clean);
+    if (bare) master = bare[0];
+  }
+  if (!master) {
+    logHitD("vid", { src: src.split("/").pop(), ok: false, code: status, pv, door: "deno" });
+    return { ok: false, diag: { code: status, len: text.length }, error: "no m3u8 in embed page" };
+  }
+  if (vidCacheD.size > 100) vidCacheD.clear();
+  vidCacheD.set(src, { at: Date.now(), master });
+  logHitD("vid", { src: src.split("/").pop(), ok: true, cached: 0, pv, door: "deno" });
+  return { ok: true, master: hlsProxyUrlD(reqUrl.origin, master, src, pv), diag: { code: status, cached: 0 } };
+}
+
+async function relayHlsD(req: Request): Promise<Response> {
+  const url = new URL(req.url);
+  const pv = url.searchParams.get("pv") || "";
+  let target = "";
+  let referer = "";
+  try {
+    target = b64dD(url.searchParams.get("u") || "");
+    referer = b64dD(url.searchParams.get("r") || "");
+  } catch {
+    return json({ ok: false, error: "bad u/r params" }, 400);
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(target);
+  } catch {
+    return json({ ok: false, error: "bad target" }, 400);
+  }
+  if (!isVidHostD(parsed.hostname)) {
+    return json({ ok: false, error: "target host not allowed" }, 400);
+  }
+  let up: Response;
+  try {
+    up = await fetch(target, {
+      redirect: "follow",
+      signal: AbortSignal.timeout(120000),
+      headers: { ...BROWSER_HEADERS, Referer: referer || "https://egydead.ca/" },
+    });
+  } catch (e) {
+    logHitD("hls", { err: String((e as Error)?.message || e).slice(0, 60), pv, door: "deno" });
+    return json({ ok: false, error: String((e as Error)?.message || e) }, 502);
+  }
+  const ctype = (up.headers.get("content-type") || "").toLowerCase();
+  const isPlaylist = target.includes(".m3u8") || ctype.includes("mpegurl");
+  if (isPlaylist) {
+    const text = await up.text();
+    if (up.status !== 200 || !text.startsWith("#EXTM3U")) {
+      // Never rewrite an error page as if it were a playlist.
+      logHitD("hls", { kind: "playlist-err", status: up.status, pv, door: "deno" });
+      return new Response(text.slice(0, 500), {
+        status: up.status,
+        headers: { "Content-Type": "text/plain; charset=utf-8" },
+      });
+    }
+    const out = text.split("\n").map((line) => {
+      const t = line.trim();
+      if (!t) return line;
+      if (t.startsWith("#")) {
+        return t.replace(/URI="([^"]+)"/g, (whole, uri: string) => {
+          try {
+            const abs = new URL(uri, target).toString();
+            return `URI="${hlsProxyUrlD(url.origin, abs, referer, pv)}"`;
+          } catch {
+            return whole;
+          }
+        });
+      }
+      try {
+        const abs = new URL(t, target).toString();
+        return hlsProxyUrlD(url.origin, abs, referer, pv);
+      } catch {
+        return line;
+      }
+    }).join("\n");
+    logHitD("hls", { kind: "playlist", status: up.status, bytes: out.length, pv, door: "deno" });
+    return new Response(out, {
+      status: up.status,
+      headers: { "Content-Type": "application/vnd.apple.mpegurl", "Cache-Control": "no-cache" },
+    });
+  }
+  const headers = new Headers();
+  headers.set("Content-Type", ctype || "application/octet-stream");
+  headers.set("Cache-Control", "no-cache");
+  const len = up.headers.get("content-length");
+  if (len) headers.set("Content-Length", len);
+  if (!up.body) return new Response(null, { status: up.status, headers });
+  let segBytes = 0;
+  const counter = new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      segBytes += chunk.byteLength;
+      controller.enqueue(chunk);
+    },
+    flush() {
+      logHitD("hls", { kind: "segment", status: up.status, bytes: segBytes, pv, door: "deno" });
+    },
+  });
+  return new Response(up.body.pipeThrough(counter), { status: up.status, headers });
+}
