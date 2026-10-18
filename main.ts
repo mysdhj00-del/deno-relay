@@ -429,6 +429,17 @@ Deno.serve(async (req: Request) => {
     }
   }
 
+  if (url.pathname === "/relay/ping") {
+    // v21 stage beacon for the EgyDead provider: log-only endpoint.
+    logHitD("ping", {
+      stage: url.searchParams.get("stage") || "",
+      n: url.searchParams.get("n") || "",
+      pv: url.searchParams.get("pv") || "",
+      door: "deno",
+    });
+    return json({ ok: true });
+  }
+
   if (url.pathname === "/relay/vid") {
     const src = url.searchParams.get("src");
     if (!src) return json({ ok: false, error: "missing src param" }, 400);
